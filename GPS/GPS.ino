@@ -14,15 +14,10 @@ bool RTK_ENABLED = false;
 
 #include <SerLCD.h>
 #include <WiFi.h>
-#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
+#include <SparkFun_u-blox_GNSS_v3.h>
 #include <Adafruit_MCP4728.h>
 #include <esp32-hal-timer.h>
-
-#if defined(ARDUINO_ARCH_ESP32)
-#include "base64.h" //Built-in ESP32 library
-#else
-#include <Base64.h> //nfriendly library from https://github.com/adamvr/arduino-base64, will work with any platform
-#endif
+#include <Base64.h>
 
 #include "bigFontChars.h"
 #include "secrets.h"
@@ -40,6 +35,7 @@ WiFiClient ntripClient;
 #define UPDATE_RATE_DISPLAY 2     // Hz
 #define UPDATE_RATE_GNSS_STATUS 5 // Hz
 #define UPDATE_RATE_ADC 50        // Hz
+#define GNSS_SOLN_RATE 20         // Hz (20 maximum)
 
 enum State
 {
@@ -69,19 +65,19 @@ struct ECEFStateVector_t
     float velAcc = -1;
 
     // Compute magnitude of the position vector
-    double posMagnitude() const
+    double posMagnitude() volatile
     {
         return sqrt(x * x + y * y + z * z);
     }
 
     // Compute magnitude of the velocity vector
-    double velMagnitude() const
+    double velMagnitude() volatile
     {
         return sqrt(vx * vx + vy * vy + vz * vz);
     }
 
     // Overload the subtraction operator
-    ECEFStateVector_t operator-(const ECEFStateVector_t &other) const
+    ECEFStateVector_t operator-(volatile ECEFStateVector_t &other) volatile
     {
         ECEFStateVector_t result;
 
@@ -103,8 +99,7 @@ struct ECEFStateVector_t
     }
 };
 
-volatile ECEFStateVector_t currentPosition;
-volatile ECEFStateVector_t startPosition;
+volatile ECEFStateVector_t startPosition, currentPosition;
 
 struct GNSSState_t
 {
@@ -127,7 +122,7 @@ struct GNSSState_t
     // 0: no carrier phase range solution
     // 1: carrier phase range solution with floating ambiguities
     // 2: carrier phase range solution with fixed ambiguities
-}
+};
 
 volatile GNSSState_t GNSSState;
 volatile unsigned long lastRTCMDataTime; // Last time we received RTCM data
@@ -166,15 +161,15 @@ Things I want to display
 /****** CALLBACKS AND POINTER FUNCTIONS */
 
 // High precision ECEF data callback
-void callback_HPPOSECEF(UBX_NAV_HPPOSEECEF_data_t *pack)
+void callback_HPPOSECEF(UBX_NAV_HPPOSECEF_data_t *pack)
 {
     // Check to make sure pointer is valid and position is not invalid
     if (pack == NULL)
         return;
 
-    if (pack->flags.bits.invalidECEF)
+    if (pack->flags.bits.invalidEcef)
     {
-        currentPosition->posAcc = -1;
+        currentPosition.posAcc = -1;
         return;
     }
 
@@ -195,10 +190,10 @@ void callback_HPPOSECEF(UBX_NAV_HPPOSEECEF_data_t *pack)
     double d_ECEFY = ((double)ECEFY) / 100.0 + ((double)ECEFYHp) / 10000.0;
     double d_ECEFZ = ((double)ECEFZ) / 100.0 + ((double)ECEFZHp) / 10000.0;
 
-    currentPosition->x = d_ECEFX;
-    currentPosition->y = d_ECEFY;
-    currentPosition->z = d_ECEFZ;
-    currentPosition->posAcc = accuracy;
+    currentPosition.x = d_ECEFX;
+    currentPosition.y = d_ECEFY;
+    currentPosition.z = d_ECEFZ;
+    currentPosition.posAcc = accuracy;
 
     GNSSDataCount++; // Add one to data count
 }
@@ -217,10 +212,10 @@ void callback_VELECEF(UBX_NAV_VELECEF_data_t *pack)
     double ecefVY = (double)pack->ecefVY / 100.0;
     double ecefVZ = (double)pack->ecefVZ / 100.0;
 
-    currentPosition->vx = ecefVX;
-    currentPosition->vy = ecefVY;
-    currentPosition->vz = ecefVZ;
-    currentPosition->velAcc = accuracy;
+    currentPosition.vx = ecefVX;
+    currentPosition.vy = ecefVY;
+    currentPosition.vz = ecefVZ;
+    currentPosition.velAcc = accuracy;
 }
 
 // PVT data callback (for fixType, carrierType, and SIV)
@@ -228,10 +223,10 @@ void callback_VELECEF(UBX_NAV_VELECEF_data_t *pack)
 void callback_PVT(UBX_NAV_PVT_data_t *pack)
 {
     // We don't want the low-accuracy NED data, just want the SIV and fix parameters
-    GNSSState->siv = pack->numSV;
-    GNSSState->isFixOK = pack->flags.bits.gnssFixOK;
-    GNSSState->carrierSolution = (uint8_t)pack->flags.bits.carrSoln;
-    GNSSState->fixType = pack->fixType;
+    GNSSState.siv = pack->numSV;
+    GNSSState.isFixOK = pack->flags.bits.gnssFixOK;
+    GNSSState.carrierSolution = (uint8_t)pack->flags.bits.carrSoln;
+    GNSSState.fixType = pack->fixType;
 }
 
 // Timed interrupt for display update (2 Hz)
@@ -253,9 +248,9 @@ void IRAM_ATTR displayUpdateISR()
     RTCMDataCount = 0;
 
     sprintf(buf, "GPS-%s G:%.1fR:%.1fHz",
-            (GNSSState->isReady) ? ((RTK_ENABLED) ? "RTK" : "3DO") : "INI", // GPS status
-            gpsUpdateRate,                                                  // GPS update rate in Hz
-            rtcmUpdateRate);                                                // RTCM update rate in Hz
+            (GNSSState.isReady) ? ((RTK_ENABLED) ? "RTK" : "3DO") : "INI", // GPS status
+            gpsUpdateRate,                                                 // GPS update rate in Hz
+            rtcmUpdateRate);                                               // RTCM update rate in Hz
     buf[20] = '\0';
     lcd.print(buf);
 
@@ -263,54 +258,54 @@ void IRAM_ATTR displayUpdateISR()
     lcd.setCursor(0, 1);
     lcd.print("                    ");
     lcd.setCursor(0, 1);
-    char buf[40]; // Buffer for formatted string
-    char ft[3];   // Buffer for fix type
-    char cst[3];  // Buffer for carrier solution type
-    switch (GNSSState->fixType)
+    memset(buf, 0, sizeof(buf)); // Buffer for formatted string
+    char ft[3];                  // Buffer for fix type
+    char cst[3];                 // Buffer for carrier solution type
+    switch (GNSSState.fixType)
     {
     case 0:
-        strcopy(ft, "NF"); // No fix
+        strcpy(ft, "NF"); // No fix
         break;
     case 1:
-        strcopy(ft, "DR"); // Dead reckoning
+        strcpy(ft, "DR"); // Dead reckoning
         break;
     case 2:
-        strcopy(ft, "2D");
+        strcpy(ft, "2D");
         break;
     case 3:
-        strcopy(ft, "3D");
+        strcpy(ft, "3D");
         break;
     case 4:
-        strcopy(ft, "GD"); // GNSS + dead reckoning
+        strcpy(ft, "GD"); // GNSS + dead reckoning
         break;
     case 5:
-        strcopy(ft, "TO"); // Time only
+        strcpy(ft, "TO"); // Time only
         break;
     default:
-        strcopy(ft, "UN"); // Unknown
+        strcpy(ft, "UN"); // Unknown
         break;
     }
 
-    switch (GNSSState->carrierSolution)
+    switch (GNSSState.carrierSolution)
     {
     case 0:
-        strcopy(cst, "NS"); // No carrier solution
+        strcpy(cst, "NS"); // No carrier solution
         break;
     case 1:
-        strcopy(cst, "FL"); // Floating solution
+        strcpy(cst, "FL"); // Floating solution
         break;
     case 2:
-        strcopy(cst, "FX"); // Fixed solution
+        strcpy(cst, "FX"); // Fixed solution
         break;
     default:
-        strcopy(cst, "UN"); // Unknown solution type
+        strcpy(cst, "UN"); // Unknown solution type
         break;
     }
 
     if (RTK_ENABLED)
     {
         sprintf(buf, "SIV%d FT:%s CST:%s LRD%01.2f",
-                GNSSState->siv,
+                GNSSState.siv,
                 ft,
                 cst,
                 ((float)millis() - lastRTCMDataTime) / 1000.0);
@@ -318,7 +313,7 @@ void IRAM_ATTR displayUpdateISR()
     else
     {
         sprintf(buf, "SIV%d FT:%s RTKDIS",
-                GNSSState->siv,
+                GNSSState.siv,
                 ft);
     }
     buf[20] = '\0';
@@ -328,11 +323,11 @@ void IRAM_ATTR displayUpdateISR()
     lcd.setCursor(0, 2);
     lcd.print("                    ");
     lcd.setCursor(0, 2);
-    char buf[40]; // Buffer for formatted string
+    memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     double d_vel = currentPosition.velMagnitude();
     sprintf(buf, "hA%01.2f vA%01.2f V%02d.%02d",
-            currentPosition->posAcc,
-            currentPosition->velAcc,
+            currentPosition.posAcc,
+            currentPosition.velAcc,
             (int)d_vel % 100, abs((int)(d_vel * 100) % 100));
     buf[20] = '\0';
     lcd.print(buf);
@@ -341,12 +336,12 @@ void IRAM_ATTR displayUpdateISR()
     lcd.setCursor(0, 3);
     lcd.print("                    ");
     lcd.setCursor(0, 3);
-    double d_ECEFX = currentPosition->x;
-    double d_ECEFY = currentPosition->y;
-    double d_ECEFZ = currentPosition->z;
-    char buf[40]; // Buffer for formatted string
+    double d_ECEFX = currentPosition.x;
+    double d_ECEFY = currentPosition.y;
+    double d_ECEFZ = currentPosition.z;
+    memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     sprintf(buf, "%cX%02d.%02dY%02d.%02dZ%02d.%02d",
-            (GNSSState->isReady) ? 'R' : 'N',
+            (GNSSState.isReady) ? 'R' : 'N',
             (int)d_ECEFX % 100, abs((int)(d_ECEFX * 100) % 100),  // X: Last two digits of integer part, first two digits after decimal
             (int)d_ECEFY % 100, abs((int)(d_ECEFY * 100) % 100),  // Y: Same for Y
             (int)d_ECEFZ % 100, abs((int)(d_ECEFZ * 100) % 100)); // Z: Same for Z
@@ -365,28 +360,29 @@ void IRAM_ATTR GNSSStateUpdateISR()
     // Note that SIV, fixType and the like are set in the PVT callback
 
     // Sanity check the ECEF data of the most recent fix
-    GNSSState->isECEFInBounds = currentPosition->posAcc <= 5.0 && currentPosition->velAcc <= 5.0;
+    GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
 
-    GNSSState->isRTCMFresh = (lastRTCMDataTime - millis()) <= 10000;
+    GNSSState.isRTCMFresh = (lastRTCMDataTime - millis()) <= 10000;
 
-    bool oldReady = GNSSState->isReady;
+    bool oldReady = GNSSState.isReady;
     if (RTK_ENABLED)
     {
         // We care about carrier solution being >0 to indicate RTCM received, and fresh data
-        GNSSState->isReady = GNSSState->isFixOk && GNSSState->isECEFInBounds && GNSSState->fixType == 3 && GNSSState->carrierSolution > 0 && GNSSState->isRTCMFresh;
+        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3 && GNSSState.carrierSolution > 0 && GNSSState.isRTCMFresh;
     }
     else
     {
-        GNSSState->isReady = GNSSState->isFixOk && GNSSState->isECEFInBounds && GNSSState->fixType == 3;
+        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3;
     }
 
     // First time entering ready state, reset experiment position
-    if (!oldReady && GNSSState->isReady)
+    if (!oldReady && GNSSState.isReady)
     {
-        startPosition = currentPosition;
+        // NOTE this is not entirely threadsafe, casting away the volatile protection here, should probably implement a better solution
+        memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
     }
 
-    oldReady = GNSSState->isReady;
+    oldReady = GNSSState.isReady;
 
     portEXIT_CRITICAL_ISR(&timerMux);
 }
@@ -398,7 +394,7 @@ void IRAM_ATTR ADCUpdateISR()
     portENTER_CRITICAL_ISR(&timerMux);
 
     // If GNSS is ready & positions are valid
-    if (GNSSState->isReady && currentPosition->posAcc != -1 && startPosition->posAcc != -1)
+    if (GNSSState.isReady && currentPosition.posAcc != -1 && startPosition.posAcc != -1)
     {
         // dPX, dPY, dPZ, Vel -> A, B, C, D
         ECEFStateVector_t diff = currentPosition - startPosition; // Find difference in positions
@@ -407,21 +403,21 @@ void IRAM_ATTR ADCUpdateISR()
         double mappedY = mapDouble(constrainDouble(abs(diff.y), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
         double mappedZ = mapDouble(constrainDouble(abs(diff.z), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
 
-        mcp.setChannelValue(MCP4728_CHANNEL_A, mappedX);
-        mcp.setChannelValue(MCP4728_CHANNEL_B, mappedY);
-        mcp.setChannelValue(MCP4728_CHANNEL_C, mappedZ);
+        dac.setChannelValue(MCP4728_CHANNEL_A, mappedX);
+        dac.setChannelValue(MCP4728_CHANNEL_B, mappedY);
+        dac.setChannelValue(MCP4728_CHANNEL_C, mappedZ);
 
         double constrainedVel = constrainDouble(currentPosition.velMagnitude(), 0, DISP_BOUND);
         uint16_t mappedVel = mapDouble(constrainedVel, 0, DISP_BOUND, 0, 4095);
-        mcp.setChannelValue(MCP4728_CHANNEL_D, mappedVel);
+        dac.setChannelValue(MCP4728_CHANNEL_D, mappedVel);
     }
     else
     {
         // Output test pattern on DAC if GPS is not ready (triangle wave)
-        mcp.setChannelValue(MCP4728_CHANNEL_A, millis() % 4095);
-        mcp.setChannelValue(MCP4728_CHANNEL_B, (millis() + 1024) % 4095);
-        mcp.setChannelValue(MCP4728_CHANNEL_C, (millis() + 2048) % 4095);
-        mcp.setChannelValue(MCP4728_CHANNEL_D, (millis() + 3072) % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_A, millis() % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_B, (millis() + 1024) % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_C, (millis() + 2048) % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_D, (millis() + 3072) % 4095);
     }
 
     portEXIT_CRITICAL_ISR(&timerMux);
@@ -499,32 +495,35 @@ void setup()
     if (sizeof(double) != 8) // Check double is 64-bit
         Serial.println(F("double is not 64-bit. ECEF resolution may be limited!"));
 
-    GNSS.setI2COutput(COM_TYPE_UBX);                                                // Turn off NMEA noise
-    GNSS.setPortInput(COM_PORT_I2C, COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); // Be sure RTCM3 input is enabled. UBX + RTCM3 is not a valid state.
+    GNSS.setI2COutput(COM_TYPE_UBX);                                 // Turn off NMEA noise
+    GNSS.setI2CInput(COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); // Be sure RTCM3 input is enabled. UBX + RTCM3 is not a valid state.
 
-    GNSS.setNavigationFrequency(20); // Set output in Hz (Max navigation frequency)
+    GNSS.setNavigationFrequency(GNSS_SOLN_RATE); // Set output in Hz (Max navigation frequency)
 
     GNSS.saveConfiguration();
 
-    // Setup callback functions
-    GNSS.setAutoHPPOSECEFcallbackPtr(&callback_HPPOSECEF);
-    GNSS.setAutoVELECEFcallbackPtr(&callback_VELECEF);
-    GNSS.setAutoPVTcallbackPtr(&callback_PVT);
+    // Setup callback functions and update rates
+    GNSS.setAutoNAVHPPOSECEFcallbackPtr(&callback_HPPOSECEF);
+    GNSS.setAutoNAVHPPOSECEFrate(GNSS_SOLN_RATE);
+    GNSS.setAutoNAVVELECEFcallbackPtr(&callback_VELECEF);
+    GNSS.setAutoNAVVELECEFrate(GNSS_SOLN_RATE);
+    GNSS.setAutoPVTcallbackPtr(&callback_PVT); // We only need PVT for SIV and fixtype, so its update rate is lower
+    GNSS.setAutoPVTrate(1);
 
-    if (!mcp.begin())
+    if (!dac.begin())
         error("MCP4728 DAC Fail");
     lcd.print(".");
     delay(100);
     // Initial voltage spread on DAC
-    mcp.setChannelValue(MCP4728_CHANNEL_A, 4095);
-    mcp.setChannelValue(MCP4728_CHANNEL_B, 2048);
-    mcp.setChannelValue(MCP4728_CHANNEL_C, 1024);
-    mcp.setChannelValue(MCP4728_CHANNEL_D, 0);
+    dac.setChannelValue(MCP4728_CHANNEL_A, 4095);
+    dac.setChannelValue(MCP4728_CHANNEL_B, 2048);
+    dac.setChannelValue(MCP4728_CHANNEL_C, 1024);
+    dac.setChannelValue(MCP4728_CHANNEL_D, 0);
 
     // Assuming CPU frequency is 240MHz
     // Prescaler calculation: We choose a prescaler to achieve a 1MHz timer frequency (1 tick = 1us)
     // For a 240MHz CPU, prescaler = 240
-    unsigned int prescaler = getCpuFreqMHz();
+    unsigned int prescaler = getCpuFrequencyMhz();
 
     // Timer 0 for display update at 2Hz (0.5 seconds)
     timerDisplayUpdate = timerBegin(0, prescaler, true);
@@ -577,7 +576,7 @@ void setup()
                 snprintf(serverRequest, SERVER_BUFFER_SIZE, "GET /%s HTTP/1.0\r\nUser-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
                          mountPoint);
 
-                char credentials[512];
+                char credentials[SERVER_BUFFER_SIZE];
                 if (strlen(casterUser) == 0)
                 {
                     strncpy(credentials, "Accept: */*\r\nConnection: close\r\n", sizeof(credentials));
@@ -586,19 +585,28 @@ void setup()
                 {
                     // Pass base64 encoded user:pw
                     char userCredentials[sizeof(casterUser) + sizeof(casterUserPW) + 1]; // The ':' takes up a spot
-                    snprintf(userCredentials, sizeof(userCredentials), "%s:%s", casterUser, casterUserPW);
+                    snprintf(userCredentials, SERVER_BUFFER_SIZE, "%s:%s", casterUser, casterUserPW);
 
                     lcd.setCursor(0, 3);
                     lcd.print("Sending credentials");
 
+#if defined(ARDUINO_ARCH_ESP32)
+                    // Encode with ESP32 built-in library
+                    base64 b;
+                    String strEncodedCredentials = b.encode(userCredentials);
+                    char encodedCredentials[strEncodedCredentials.length() + 1];
+                    strEncodedCredentials.toCharArray(encodedCredentials, sizeof(encodedCredentials)); // Convert String to char array
+                    snprintf(credentials, sizeof(credentials), "Authorization: Basic %s\r\n", encodedCredentials);
+#else
                     // Encode with nfriendly library
                     int encodedLen = base64_enc_len(strlen(userCredentials));
                     char encodedCredentials[encodedLen];                                         // Create array large enough to house encoded data
                     base64_encode(encodedCredentials, userCredentials, strlen(userCredentials)); // Note: Input array is consumed
+#endif
                 }
 
-                strncat(serverRequest, credentials, SERVER_BUFFER_SIZE);
-                strncat(serverRequest, "\r\n", SERVER_BUFFER_SIZE);
+                strncat(serverRequest, credentials, SERVER_BUFFER_SIZE - 1);
+                strncat(serverRequest, "\r\n", SERVER_BUFFER_SIZE - 1);
                 ntripClient.write(serverRequest, strlen(serverRequest));
             }
 
@@ -646,7 +654,8 @@ void setup()
                 lcd.setCursor(0, 2);
                 lcd.print(response);
                 delay(5000);
-                error("Ntrip BadCred") return;
+                error("Ntrip BadCred");
+                return;
             }
             else
             {
@@ -688,7 +697,7 @@ void loop()
         if (ntripClient.connected() == true)
         {
             uint8_t rtcmData[512 * 4]; // Most incoming data is around 500 bytes but may be larger
-            rtcmCount = 0;
+            long rtcmCount = 0;
 
             // Print any available RTCM data
             while (ntripClient.available())
