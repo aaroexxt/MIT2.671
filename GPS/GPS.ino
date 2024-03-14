@@ -4,7 +4,7 @@ March 2024
 */
 
 /****** ENABLE RTK ON THE LINE BELOW (comment out to disable) */
-#define RTK_ENABLED_D
+// #define RTK_ENABLED_D
 
 #ifdef RTK_ENABLED_D
 bool RTK_ENABLED = true;
@@ -16,8 +16,9 @@ bool RTK_ENABLED = false;
 #include <WiFi.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include <Adafruit_MCP4728.h>
-#include <esp32-hal-timer.h>
+#include "esp_task_wdt.h"
 #include <Base64.h>
+#include <TickTwo.h>
 
 #include "bigFontChars.h"
 #include "secrets.h"
@@ -32,20 +33,10 @@ WiFiClient ntripClient;
 
 #define DISP_BOUND (VMAX / MTOV) // Bounded maximunm of sensor value
 
-#define UPDATE_RATE_DISPLAY 2     // Hz
+#define UPDATE_RATE_DISPLAY 1     // Hz
 #define UPDATE_RATE_GNSS_STATUS 5 // Hz
 #define UPDATE_RATE_ADC 50        // Hz
 #define GNSS_SOLN_RATE 20         // Hz (20 maximum)
-
-enum State
-{
-    GPS_INIT,
-    GPS_NORM_FIX,
-    GPS_RTK_ACQUIRED,
-    GPS_RTK_FIX
-};
-
-State currentState = GPS_INIT;
 
 // ECEF position reported by the GPS
 struct ECEFStateVector_t
@@ -65,19 +56,19 @@ struct ECEFStateVector_t
     float velAcc = -1;
 
     // Compute magnitude of the position vector
-    double posMagnitude() volatile
+    double posMagnitude() const
     {
         return sqrt(x * x + y * y + z * z);
     }
 
     // Compute magnitude of the velocity vector
-    double velMagnitude() volatile
+    double velMagnitude() const
     {
         return sqrt(vx * vx + vy * vy + vz * vz);
     }
 
     // Overload the subtraction operator
-    ECEFStateVector_t operator-(volatile ECEFStateVector_t &other) volatile
+    ECEFStateVector_t operator-(ECEFStateVector_t &other) const
     {
         ECEFStateVector_t result;
 
@@ -99,7 +90,7 @@ struct ECEFStateVector_t
     }
 };
 
-volatile ECEFStateVector_t startPosition, currentPosition;
+ECEFStateVector_t startPosition, currentPosition;
 
 struct GNSSState_t
 {
@@ -124,23 +115,19 @@ struct GNSSState_t
     // 2: carrier phase range solution with fixed ambiguities
 };
 
-volatile GNSSState_t GNSSState;
-volatile unsigned long lastRTCMDataTime; // Last time we received RTCM data
-volatile unsigned int RTCMDataCount;     // Used for counting RTCM update rate
-volatile unsigned int GNSSDataCount;     // Used for counting GNSS update rate
+GNSSState_t GNSSState;
+unsigned long lastRTCMDataTime; // Last time we received RTCM data
+unsigned int RTCMDataCount;     // Used for counting RTCM update rate
+unsigned int GNSSDataCount;     // Used for counting GNSS update rate
 
 // Forward declarations of the ISR functions
-void IRAM_ATTR displayUpdateISR();
-void IRAM_ATTR GNSSStateUpdateISR();
-void IRAM_ATTR ADCUpdateISR();
+void displayUpdateISR();
+void GNSSStateUpdateISR();
+void ADCUpdateISR();
 
-// Timer handles for each ISR
-hw_timer_t *timerDisplayUpdate = NULL;
-hw_timer_t *timerGNSSStateUpdate = NULL;
-hw_timer_t *timerADCUpdate = NULL;
-
-// Mutex lock for ISRs
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+TickTwo TdisplayUpdate(displayUpdateISR, 1000 / UPDATE_RATE_DISPLAY, 0, MILLIS);
+TickTwo TGNSSStateUpdate(GNSSStateUpdateISR, 1000 / UPDATE_RATE_GNSS_STATUS, 0, MILLIS);
+TickTwo TADCUpdate(ADCUpdateISR, 1000 / UPDATE_RATE_ADC, 0, MILLIS);
 
 /*
 GPS stuff
@@ -163,6 +150,7 @@ Things I want to display
 // High precision ECEF data callback
 void callback_HPPOSECEF(UBX_NAV_HPPOSECEF_data_t *pack)
 {
+    Serial.println("HPPOSECEF");
     // Check to make sure pointer is valid and position is not invalid
     if (pack == NULL)
         return;
@@ -229,34 +217,95 @@ void callback_PVT(UBX_NAV_PVT_data_t *pack)
     GNSSState.fixType = pack->fixType;
 }
 
-// Timed interrupt for display update (2 Hz)
+// Timed interrupt for GNSS state update (5 Hz)
 
-void IRAM_ATTR displayUpdateISR()
+void GNSSStateUpdateISR()
 {
-    portENTER_CRITICAL_ISR(&timerMux);
+    // Note that SIV, fixType and the like are set in the PVT callback
 
+    // Sanity check the ECEF data of the most recent fix
+    GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
+
+    GNSSState.isRTCMFresh = (lastRTCMDataTime - millis()) <= 10000;
+
+    bool oldReady = GNSSState.isReady;
+    if (RTK_ENABLED)
+    {
+        // We care about carrier solution being >0 to indicate RTCM received, and fresh data
+        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3 && GNSSState.carrierSolution > 0 && GNSSState.isRTCMFresh;
+    }
+    else
+    {
+        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3;
+    }
+
+    // First time entering ready state, reset experiment position
+    if (!oldReady && GNSSState.isReady)
+    {
+        // NOTE this is not entirely threadsafe, casting away the protection here, should probably implement a better solution
+        memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
+    }
+}
+
+// Timed interrupt for ADC update (50 Hz)
+
+void ADCUpdateISR()
+{
+    // If GNSS is ready & positions are valid
+    if (GNSSState.isReady && currentPosition.posAcc != -1 && startPosition.posAcc != -1)
+    {
+        // dPX, dPY, dPZ, Vel -> A, B, C, D
+        ECEFStateVector_t diff = currentPosition - startPosition; // Find difference in positions
+
+        double mappedX = mapDouble(constrainDouble(abs(diff.x), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
+        double mappedY = mapDouble(constrainDouble(abs(diff.y), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
+        double mappedZ = mapDouble(constrainDouble(abs(diff.z), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
+
+        dac.setChannelValue(MCP4728_CHANNEL_A, mappedX);
+        dac.setChannelValue(MCP4728_CHANNEL_B, mappedY);
+        dac.setChannelValue(MCP4728_CHANNEL_C, mappedZ);
+
+        double constrainedVel = constrainDouble(currentPosition.velMagnitude(), 0, DISP_BOUND);
+        uint16_t mappedVel = mapDouble(constrainedVel, 0, DISP_BOUND, 0, 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_D, mappedVel);
+    }
+    else
+    {
+        // Output test pattern on DAC if GPS is not ready (triangle wave)
+        dac.setChannelValue(MCP4728_CHANNEL_A, millis() % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_B, (millis() + 1024) % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_C, (millis() + 2048) % 4095);
+        dac.setChannelValue(MCP4728_CHANNEL_D, (millis() + 3072) % 4095);
+    }
+}
+
+// Timed interrupt for display (2 Hz)
+void displayUpdateISR()
+{
     // Line 1: GPS Status, GPS update rate, RTCM update rate
-    lcd.setCursor(0, 0);
-    lcd.print("                    ");
-    lcd.setCursor(0, 0);
+    lcd.clear();
     char buf[40]; // Buffer for formatted string
     // Calculating update rates in Hz, assuming counts are reset after each function call
-    float gpsUpdateRate = (float)UPDATE_RATE_DISPLAY / GNSSDataCount;
-    float rtcmUpdateRate = (float)UPDATE_RATE_DISPLAY / RTCMDataCount;
+    float gpsUpdateRate = (float)GNSSDataCount / (float)UPDATE_RATE_DISPLAY;
+    float rtcmUpdateRate = RTK_ENABLED ? (float)RTCMDataCount / (float)UPDATE_RATE_DISPLAY : 0;
+
+    if (isinf(gpsUpdateRate))
+        gpsUpdateRate = 0;
+    if (isinf(rtcmUpdateRate))
+        rtcmUpdateRate = 0;
+
     // Reset data counts
     GNSSDataCount = 0;
     RTCMDataCount = 0;
 
-    sprintf(buf, "GPS-%s G:%.1fR:%.1fHz",
-            (GNSSState.isReady) ? ((RTK_ENABLED) ? "RTK" : "3DO") : "INI", // GPS status
-            gpsUpdateRate,                                                 // GPS update rate in Hz
-            rtcmUpdateRate);                                               // RTCM update rate in Hz
+    sprintf(buf, "GPS-%s G:%.0fR:%.0fHz",
+            (GNSSState.isReady) ? ((RTK_ENABLED) ? "RTKEN" : "3ONLY") : "INITF", // GPS status
+            gpsUpdateRate,                                                       // GPS update rate in Hz
+            rtcmUpdateRate);                                                     // RTCM update rate in Hz
     buf[20] = '\0';
     lcd.print(buf);
 
     // Line 2: SIV, fixType, carrierFixType, RTK last packet time (s)
-    lcd.setCursor(0, 1);
-    lcd.print("                    ");
     lcd.setCursor(0, 1);
     memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     char ft[3];                  // Buffer for fix type
@@ -321,8 +370,6 @@ void IRAM_ATTR displayUpdateISR()
 
     // Line 3: Accuracies, and velocity magnitude
     lcd.setCursor(0, 2);
-    lcd.print("                    ");
-    lcd.setCursor(0, 2);
     memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     double d_vel = currentPosition.velMagnitude();
     sprintf(buf, "hA%01.2f vA%01.2f V%02d.%02d",
@@ -333,8 +380,6 @@ void IRAM_ATTR displayUpdateISR()
     lcd.print(buf);
 
     // Line 4: Ready state (as first char) & XYZ ECEF Position
-    lcd.setCursor(0, 3);
-    lcd.print("                    ");
     lcd.setCursor(0, 3);
     double d_ECEFX = currentPosition.x;
     double d_ECEFY = currentPosition.y;
@@ -347,80 +392,6 @@ void IRAM_ATTR displayUpdateISR()
             (int)d_ECEFZ % 100, abs((int)(d_ECEFZ * 100) % 100)); // Z: Same for Z
     buf[20] = '\0';                                               // Only print first 20 chars
     lcd.print(buf);
-
-    portEXIT_CRITICAL_ISR(&timerMux);
-}
-
-// Timed interrupt for GNSS state update (5 Hz)
-
-void IRAM_ATTR GNSSStateUpdateISR()
-{
-    portENTER_CRITICAL_ISR(&timerMux);
-
-    // Note that SIV, fixType and the like are set in the PVT callback
-
-    // Sanity check the ECEF data of the most recent fix
-    GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
-
-    GNSSState.isRTCMFresh = (lastRTCMDataTime - millis()) <= 10000;
-
-    bool oldReady = GNSSState.isReady;
-    if (RTK_ENABLED)
-    {
-        // We care about carrier solution being >0 to indicate RTCM received, and fresh data
-        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3 && GNSSState.carrierSolution > 0 && GNSSState.isRTCMFresh;
-    }
-    else
-    {
-        GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3;
-    }
-
-    // First time entering ready state, reset experiment position
-    if (!oldReady && GNSSState.isReady)
-    {
-        // NOTE this is not entirely threadsafe, casting away the volatile protection here, should probably implement a better solution
-        memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
-    }
-
-    oldReady = GNSSState.isReady;
-
-    portEXIT_CRITICAL_ISR(&timerMux);
-}
-
-// Timed interrupt for ADC update (50 Hz)
-
-void IRAM_ATTR ADCUpdateISR()
-{
-    portENTER_CRITICAL_ISR(&timerMux);
-
-    // If GNSS is ready & positions are valid
-    if (GNSSState.isReady && currentPosition.posAcc != -1 && startPosition.posAcc != -1)
-    {
-        // dPX, dPY, dPZ, Vel -> A, B, C, D
-        ECEFStateVector_t diff = currentPosition - startPosition; // Find difference in positions
-
-        double mappedX = mapDouble(constrainDouble(abs(diff.x), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
-        double mappedY = mapDouble(constrainDouble(abs(diff.y), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
-        double mappedZ = mapDouble(constrainDouble(abs(diff.z), 0, DISP_BOUND), 0, DISP_BOUND, 0, 4095);
-
-        dac.setChannelValue(MCP4728_CHANNEL_A, mappedX);
-        dac.setChannelValue(MCP4728_CHANNEL_B, mappedY);
-        dac.setChannelValue(MCP4728_CHANNEL_C, mappedZ);
-
-        double constrainedVel = constrainDouble(currentPosition.velMagnitude(), 0, DISP_BOUND);
-        uint16_t mappedVel = mapDouble(constrainedVel, 0, DISP_BOUND, 0, 4095);
-        dac.setChannelValue(MCP4728_CHANNEL_D, mappedVel);
-    }
-    else
-    {
-        // Output test pattern on DAC if GPS is not ready (triangle wave)
-        dac.setChannelValue(MCP4728_CHANNEL_A, millis() % 4095);
-        dac.setChannelValue(MCP4728_CHANNEL_B, (millis() + 1024) % 4095);
-        dac.setChannelValue(MCP4728_CHANNEL_C, (millis() + 2048) % 4095);
-        dac.setChannelValue(MCP4728_CHANNEL_D, (millis() + 3072) % 4095);
-    }
-
-    portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 // Function to map double values
@@ -459,8 +430,8 @@ void setup()
     lcd.begin(Wire);
     digitalWrite(18, HIGH); // Status LED on
     delay(1000);
-    lcd.setBacklight(50, 50, 50); // Set backlight to bright white
-    lcd.setContrast(5);           // Set contrast. Lower to 0 for higher contrast.
+    lcd.setBacklight(255, 255, 255); // Set backlight to bright white
+    lcd.setContrast(5);              // Set contrast. Lower to 0 for higher contrast.
 
     lcd.clear(); // Clear the display - this moves the cursor to home position as well
     lcd.setCursor(0, 0);
@@ -503,48 +474,34 @@ void setup()
     GNSS.saveConfiguration();
 
     // Setup callback functions and update rates
+    // DO NOT RUN SETRATE IT DOES NOT WORK
     GNSS.setAutoNAVHPPOSECEFcallbackPtr(&callback_HPPOSECEF);
-    GNSS.setAutoNAVHPPOSECEFrate(GNSS_SOLN_RATE);
+    // GNSS.setAutoNAVHPPOSECEFrate(GNSS_SOLN_RATE);
     GNSS.setAutoNAVVELECEFcallbackPtr(&callback_VELECEF);
-    GNSS.setAutoNAVVELECEFrate(GNSS_SOLN_RATE);
+    // GNSS.setAutoNAVVELECEFrate(GNSS_SOLN_RATE);
     GNSS.setAutoPVTcallbackPtr(&callback_PVT); // We only need PVT for SIV and fixtype, so its update rate is lower
-    GNSS.setAutoPVTrate(1);
+    // GNSS.setAutoPVTrate(1);
 
-    if (!dac.begin())
+    if (!dac.begin(0x64))
         error("MCP4728 DAC Fail");
-    lcd.print(".");
-    delay(100);
+
     // Initial voltage spread on DAC
     dac.setChannelValue(MCP4728_CHANNEL_A, 4095);
     dac.setChannelValue(MCP4728_CHANNEL_B, 2048);
     dac.setChannelValue(MCP4728_CHANNEL_C, 1024);
     dac.setChannelValue(MCP4728_CHANNEL_D, 0);
+    lcd.print(".");
+    delay(100);
 
-    // Assuming CPU frequency is 240MHz
-    // Prescaler calculation: We choose a prescaler to achieve a 1MHz timer frequency (1 tick = 1us)
-    // For a 240MHz CPU, prescaler = 240
-    unsigned int prescaler = getCpuFrequencyMhz();
+    // // Setup ESP32 watchdog timer
+    // disableCore0WDT();
+    // disableCore1WDT();
+    // disableLoopWDT();
+    // lcd.print(".");
+    // delay(100);
 
-    // Timer 0 for display update at 2Hz (0.5 seconds)
-    timerDisplayUpdate = timerBegin(0, prescaler, true);
-    timerAttachInterrupt(timerDisplayUpdate, &displayUpdateISR, true);
-    timerAlarmWrite(timerDisplayUpdate, (1000000 / UPDATE_RATE_DISPLAY), true); // 0.5 seconds in microseconds
-    timerAlarmEnable(timerDisplayUpdate);
-
-    // Timer 1 for GNSS state update at 5Hz (0.2 seconds)
-    timerGNSSStateUpdate = timerBegin(1, prescaler, true);
-    timerAttachInterrupt(timerGNSSStateUpdate, &GNSSStateUpdateISR, true);
-    timerAlarmWrite(timerGNSSStateUpdate, (1000000 / UPDATE_RATE_GNSS_STATUS), true); // 0.2 seconds in microseconds
-    timerAlarmEnable(timerGNSSStateUpdate);
-
-    // Timer 2 for ADC update at 50Hz (0.02 seconds)
-    timerADCUpdate = timerBegin(2, prescaler, true);
-    timerAttachInterrupt(timerADCUpdate, &ADCUpdateISR, true);
-    timerAlarmWrite(timerADCUpdate, (1000000 / UPDATE_RATE_ADC), true); // 0.02 seconds in microseconds
-    timerAlarmEnable(timerADCUpdate);
-
-    // Immediately grab mutex so it does't get overwritten
-    portENTER_CRITICAL(&timerMux);
+    // lcd.print(".");
+    // delay(100);
 
     // Start wifi connection
     if (RTK_ENABLED)
@@ -557,7 +514,7 @@ void setup()
         {
             if (ntripClient.connect(casterHost, casterPort) == false)
             {
-                error("WiFi FailConn");
+                error("WiFi ConnFail");
             }
             else
             {
@@ -677,20 +634,23 @@ void setup()
     lcd.print("Hware Check OK.");
     delay(2000);
     lcd.clear();
-    portEXIT_CRITICAL(&timerMux); // Allow interrupts to start running
+
+    // Start timers
+    TdisplayUpdate.start();
+    TGNSSStateUpdate.start();
+    TADCUpdate.start();
 }
 
 void loop()
 {
-    static unsigned long lastStatusCheckTime = 0;
-    static unsigned long lastPosCheckTime = 0;
-    unsigned long currentMillis = millis();
 
-    // Prevent interrupts while running these functions
-    portENTER_CRITICAL(&timerMux);
     GNSS.checkUblox(); // Check for new data data
     GNSS.checkCallbacks();
-    portEXIT_CRITICAL(&timerMux);
+
+    // Software timers
+    TdisplayUpdate.update();
+    TGNSSStateUpdate.update();
+    TADCUpdate.update();
 
     if (RTK_ENABLED)
     {
@@ -754,6 +714,7 @@ void hang()
 void error(String message)
 {
     lcd.setFastBacklight(0xFF0000);
+    lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Fatal Error:");
     lcd.setCursor(0, 1);
