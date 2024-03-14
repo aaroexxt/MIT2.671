@@ -4,7 +4,7 @@ March 2024
 */
 
 /****** ENABLE RTK ON THE LINE BELOW (comment out to disable) */
-// #define RTK_ENABLED_D
+#define RTK_ENABLED_D
 
 #ifdef RTK_ENABLED_D
 bool RTK_ENABLED = true;
@@ -33,7 +33,7 @@ WiFiClient ntripClient;
 
 #define DISP_BOUND (VMAX / MTOV) // Bounded maximunm of sensor value
 
-#define UPDATE_RATE_DISPLAY 1     // Hz
+#define UPDATE_RATE_DISPLAY 2     // Hz
 #define UPDATE_RATE_GNSS_STATUS 5 // Hz
 #define UPDATE_RATE_ADC 50        // Hz
 #define GNSS_SOLN_RATE 20         // Hz (20 maximum)
@@ -150,7 +150,6 @@ Things I want to display
 // High precision ECEF data callback
 void callback_HPPOSECEF(UBX_NAV_HPPOSECEF_data_t *pack)
 {
-    Serial.println("HPPOSECEF");
     // Check to make sure pointer is valid and position is not invalid
     if (pack == NULL)
         return;
@@ -226,7 +225,7 @@ void GNSSStateUpdateISR()
     // Sanity check the ECEF data of the most recent fix
     GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
 
-    GNSSState.isRTCMFresh = (lastRTCMDataTime - millis()) <= 10000;
+    GNSSState.isRTCMFresh = ((millis() - lastRTCMDataTime) <= 10000) ? 1 : 0;
 
     bool oldReady = GNSSState.isReady;
     if (RTK_ENABLED)
@@ -239,8 +238,14 @@ void GNSSStateUpdateISR()
         GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3;
     }
 
-    // First time entering ready state, reset experiment position
-    if (!oldReady && GNSSState.isReady)
+    // If its going back to not ready, temp fix by leaving it there. TODO this is a hack, fix
+    if (!GNSSState.isReady && oldReady)
+    {
+        GNSSState.isReady = true;
+    }
+
+    // First time entering ready state with start position unset, reset experiment position
+    if (!oldReady && GNSSState.isReady && startPosition.posAcc == -1)
     {
         // NOTE this is not entirely threadsafe, casting away the protection here, should probably implement a better solution
         memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
@@ -283,11 +288,10 @@ void ADCUpdateISR()
 void displayUpdateISR()
 {
     // Line 1: GPS Status, GPS update rate, RTCM update rate
-    lcd.clear();
     char buf[40]; // Buffer for formatted string
     // Calculating update rates in Hz, assuming counts are reset after each function call
-    float gpsUpdateRate = (float)GNSSDataCount / (float)UPDATE_RATE_DISPLAY;
-    float rtcmUpdateRate = RTK_ENABLED ? (float)RTCMDataCount / (float)UPDATE_RATE_DISPLAY : 0;
+    float gpsUpdateRate = (float)GNSSDataCount * (float)UPDATE_RATE_DISPLAY;
+    float rtcmUpdateRate = RTK_ENABLED ? (float)RTCMDataCount * (float)UPDATE_RATE_DISPLAY : 0;
 
     if (isinf(gpsUpdateRate))
         gpsUpdateRate = 0;
@@ -298,18 +302,18 @@ void displayUpdateISR()
     GNSSDataCount = 0;
     RTCMDataCount = 0;
 
-    sprintf(buf, "GPS-%s G:%.0fR:%.0fHz",
+    sprintf(buf, "GPS-%s G:%.0fR:%.0fHz ",
             (GNSSState.isReady) ? ((RTK_ENABLED) ? "RTKEN" : "3ONLY") : "INITF", // GPS status
             gpsUpdateRate,                                                       // GPS update rate in Hz
             rtcmUpdateRate);                                                     // RTCM update rate in Hz
     buf[20] = '\0';
+    lcd.setCursor(0, 0);
     lcd.print(buf);
 
     // Line 2: SIV, fixType, carrierFixType, RTK last packet time (s)
-    lcd.setCursor(0, 1);
     memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     char ft[3];                  // Buffer for fix type
-    char cst[3];                 // Buffer for carrier solution type
+    char cst[5];                 // Buffer for carrier solution type
     switch (GNSSState.fixType)
     {
     case 0:
@@ -338,26 +342,25 @@ void displayUpdateISR()
     switch (GNSSState.carrierSolution)
     {
     case 0:
-        strcpy(cst, "NS"); // No carrier solution
+        strcpy(cst, "NSOL"); // No carrier solution
         break;
     case 1:
-        strcpy(cst, "FL"); // Floating solution
+        strcpy(cst, "FLOT"); // Floating solution
         break;
     case 2:
-        strcpy(cst, "FX"); // Fixed solution
+        strcpy(cst, "FIXD"); // Fixed solution
         break;
     default:
-        strcpy(cst, "UN"); // Unknown solution type
+        strcpy(cst, "UNKN"); // Unknown solution type
         break;
     }
 
     if (RTK_ENABLED)
     {
-        sprintf(buf, "SIV%d FT:%s CST:%s LRD%01.2f",
+        sprintf(buf, "SIV:%dFT:%s CST:%s",
                 GNSSState.siv,
                 ft,
-                cst,
-                ((float)millis() - lastRTCMDataTime) / 1000.0);
+                cst);
     }
     else
     {
@@ -366,10 +369,10 @@ void displayUpdateISR()
                 ft);
     }
     buf[20] = '\0';
+    lcd.setCursor(0, 1);
     lcd.print(buf);
 
     // Line 3: Accuracies, and velocity magnitude
-    lcd.setCursor(0, 2);
     memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     double d_vel = currentPosition.velMagnitude();
     sprintf(buf, "hA%01.2f vA%01.2f V%02d.%02d",
@@ -377,21 +380,39 @@ void displayUpdateISR()
             currentPosition.velAcc,
             (int)d_vel % 100, abs((int)(d_vel * 100) % 100));
     buf[20] = '\0';
+    lcd.setCursor(0, 2);
     lcd.print(buf);
 
     // Line 4: Ready state (as first char) & XYZ ECEF Position
-    lcd.setCursor(0, 3);
-    double d_ECEFX = currentPosition.x;
-    double d_ECEFY = currentPosition.y;
-    double d_ECEFZ = currentPosition.z;
+    ECEFStateVector_t diffPos = currentPosition - startPosition;
+    double d_ECEFX = diffPos.x;
+    double d_ECEFY = diffPos.y;
+    double d_ECEFZ = diffPos.z;
     memset(buf, 0, sizeof(buf)); // Buffer for formatted string
     sprintf(buf, "%cX%02d.%02dY%02d.%02dZ%02d.%02d",
             (GNSSState.isReady) ? 'R' : 'N',
             (int)d_ECEFX % 100, abs((int)(d_ECEFX * 100) % 100),  // X: Last two digits of integer part, first two digits after decimal
             (int)d_ECEFY % 100, abs((int)(d_ECEFY * 100) % 100),  // Y: Same for Y
             (int)d_ECEFZ % 100, abs((int)(d_ECEFZ * 100) % 100)); // Z: Same for Z
-    buf[20] = '\0';                                               // Only print first 20 chars
+    buf[20] = '\0';
+    lcd.setCursor(0, 3);
     lcd.print(buf);
+}
+
+void RTKDisable()
+{
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RTCM Timeout!");
+    lcd.setCursor(0, 1);
+    lcd.print("RTK Disabling");
+    lcd.setCursor(0, 2);
+    lcd.print("Reset to reconnect");
+    delay(5000);
+
+    if (ntripClient.connected() == true)
+        ntripClient.stop();
+    RTK_ENABLED = false;
 }
 
 // Function to map double values
@@ -430,8 +451,8 @@ void setup()
     lcd.begin(Wire);
     digitalWrite(18, HIGH); // Status LED on
     delay(1000);
-    lcd.setBacklight(255, 255, 255); // Set backlight to bright white
-    lcd.setContrast(5);              // Set contrast. Lower to 0 for higher contrast.
+    lcd.setBacklight(40, 40, 40); // Set backlight to bright white
+    lcd.setContrast(5);           // Set contrast. Lower to 0 for higher contrast.
 
     lcd.clear(); // Clear the display - this moves the cursor to home position as well
     lcd.setCursor(0, 0);
@@ -453,6 +474,16 @@ void setup()
     lcd.createChar(5, C_LR);
     lcd.createChar(6, C_UMB);
     lcd.createChar(7, C_LMB);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    BFwriteString("2.671", 0, 0);
+    lcd.setCursor(0, 2);
+    lcd.print("By Aaron Becker");
+    lcd.setCursor(0, 4);
+    lcd.print("March 2024");
+    delay(3000);
+    lcd.clear();
 
     // Now, proceed to hardware check
     lcd.setCursor(0, 0);
@@ -503,6 +534,11 @@ void setup()
     // lcd.print(".");
     // delay(100);
 
+    // Start timers
+    TdisplayUpdate.start();
+    TGNSSStateUpdate.start();
+    TADCUpdate.start();
+
     // Start wifi connection
     if (RTK_ENABLED)
     {
@@ -510,11 +546,58 @@ void setup()
         lcd.setCursor(0, 0);
         lcd.print("WiFi connecting...");
 
+        Serial.print(F("Connecting to local WiFi"));
+        WiFi.begin(ssid, password);
+
+        unsigned long startConnectTime = millis();
+        const unsigned long timeoutTimeMS = 30000;
+        while (WiFi.status() != WL_CONNECTED)
+        {
+            delay(1000);
+            lcd.setCursor(0, 1);
+            lcd.print("Waiting ");
+            lcd.print((int)round((millis() - startConnectTime) / 1000));
+            lcd.print("/");
+            lcd.print(timeoutTimeMS / 1000);
+            lcd.print("s");
+
+            if (millis() - startConnectTime >= timeoutTimeMS)
+            {
+                lcd.clear();
+                lcd.print("WiFi ConnFail to");
+                lcd.setCursor(0, 1);
+                lcd.print("network:");
+                lcd.setCursor(0, 2);
+                lcd.print(ssid);
+                delay(2000);
+                RTKDisable();
+                return;
+            }
+        }
+
+        lcd.clear();
+        lcd.print(F("WiFi connOK! IP: "));
+        lcd.setCursor(0, 1);
+        lcd.println(WiFi.localIP());
+        lcd.setCursor(0, 2);
+        lcd.print("Network:");
+        lcd.setCursor(0, 3);
+        lcd.print(ssid);
+        delay(2000);
+
         if (ntripClient.connected() == false)
         {
             if (ntripClient.connect(casterHost, casterPort) == false)
             {
-                error("WiFi ConnFail");
+                lcd.clear();
+                lcd.print("Website ConnFail to");
+                lcd.setCursor(0, 1);
+                lcd.print(casterHost);
+                lcd.print(":");
+                lcd.print(casterPort);
+                delay(2000);
+                RTKDisable();
+                return;
             }
             else
             {
@@ -574,7 +657,12 @@ void setup()
                 if (millis() - timeout > 5000)
                 {
                     ntripClient.stop();
-                    error("Ntrip RTimeout");
+                    lcd.clear();
+                    lcd.print("Ntrip Server");
+                    lcd.setCursor(0, 1);
+                    lcd.print("CredReq Timeout");
+                    delay(2000);
+                    RTKDisable();
                     return;
                 }
                 delay(10);
@@ -604,53 +692,59 @@ void setup()
             lcd.setCursor(0, 0);
             if (connectionSuccess == false)
             {
-                lcd.print(F("Failed to connect to "));
+                lcd.print(F("Ntrip BadCred"));
                 lcd.setCursor(0, 1);
                 lcd.print(casterHost);
                 lcd.print(F(": "));
                 lcd.setCursor(0, 2);
                 lcd.print(response);
-                delay(5000);
-                error("Ntrip BadCred");
+                delay(2000);
+                RTKDisable();
                 return;
             }
             else
             {
-                lcd.print(F("Connected! To:"));
+                lcd.print(F("RTCM Connected! To:"));
                 lcd.setCursor(0, 1);
-                Serial.println(casterHost);
-                delay(1000);
+                lcd.print(casterHost);
+                lcd.print(":");
+                lcd.print(casterPort);
+                delay(2000);
                 lastRTCMDataTime = millis(); // Reset timeout
             }
         }
     }
-
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    BFwriteString("2.671", 0, 0);
-    lcd.setCursor(0, 2);
-    lcd.print("By Aaron Becker");
-    lcd.setCursor(0, 4);
-    lcd.print("Hware Check OK.");
-    delay(2000);
-    lcd.clear();
-
-    // Start timers
-    TdisplayUpdate.start();
-    TGNSSStateUpdate.start();
-    TADCUpdate.start();
 }
 
 void loop()
 {
 
-    GNSS.checkUblox(); // Check for new data data
+    // Check for new data from GNSS
+    GNSS.checkUblox();
     GNSS.checkCallbacks();
 
     // Software timers
     TdisplayUpdate.update();
     TGNSSStateUpdate.update();
     TADCUpdate.update();
+
+    // Check serial console for commands
+    if (Serial.available() > 0)
+    {
+        // Read the incoming byte:
+        char receivedChar = Serial.read();
+
+        // Check if the received character is 'r'
+        if (receivedChar == 'r')
+        {
+            Serial.println("Resetting experiment 0 position");
+            memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
+        }
+        else
+        {
+            Serial.println("Invalid command. Enter r to reset start position");
+        }
+    }
 
     if (RTK_ENABLED)
     {
@@ -681,19 +775,7 @@ void loop()
         // Close socket if we don't have new data for 10s
         if (millis() - lastRTCMDataTime > 10000)
         {
-            lcd.clear();
-            lcd.setCursor(0, 0);
-            lcd.print("RTCM Timeout!");
-            lcd.setCursor(0, 1);
-            lcd.print("RTK Disabling");
-            lcd.setCursor(0, 2);
-            lcd.print("Reset to reconnect");
-            delay(5000);
-
-            if (ntripClient.connected() == true)
-                ntripClient.stop();
-            return;
-            RTK_ENABLED = false;
+            RTKDisable();
         }
     }
 
