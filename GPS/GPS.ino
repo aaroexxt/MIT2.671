@@ -302,10 +302,10 @@ void displayUpdateISR()
     GNSSDataCount = 0;
     RTCMDataCount = 0;
 
-    sprintf(buf, "GPS-%s G:%.0fR:%.0fHz ",
+    sprintf(buf, "GPS-%s G:%dR:%dHz ",
             (GNSSState.isReady) ? ((RTK_ENABLED) ? "RTKEN" : "3ONLY") : "INITF", // GPS status
-            gpsUpdateRate,                                                       // GPS update rate in Hz
-            rtcmUpdateRate);                                                     // RTCM update rate in Hz
+            (int)round(gpsUpdateRate),                                           // GPS update rate in Hz
+            (int)round(rtcmUpdateRate));                                         // RTCM update rate in Hz
     buf[20] = '\0';
     lcd.setCursor(0, 0);
     lcd.print(buf);
@@ -364,7 +364,7 @@ void displayUpdateISR()
     }
     else
     {
-        sprintf(buf, "SIV%d FT:%s RTKDIS",
+        sprintf(buf, "SIV:%dFT:%s RTKDIS",
                 GNSSState.siv,
                 ft);
     }
@@ -740,9 +740,13 @@ void loop()
             Serial.println("Resetting experiment 0 position");
             memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
         }
-        else
+        else if (receivedChar == 'h')
         {
-            Serial.println("Invalid command. Enter r to reset start position");
+            ESP.restart();
+        }
+        else if ((receivedChar != '\n' && receivedChar != '\r')) // Ignore newlines
+        {
+            Serial.println("Invalid command. Enter r to reset start position, h to restart code");
         }
     }
 
