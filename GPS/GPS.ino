@@ -124,10 +124,12 @@ unsigned int GNSSDataCount;     // Used for counting GNSS update rate
 void displayUpdateISR();
 void GNSSStateUpdateISR();
 void ADCUpdateISR();
+void GNSSCallbackISR();
 
 TickTwo TdisplayUpdate(displayUpdateISR, 1000 / UPDATE_RATE_DISPLAY, 0, MILLIS);
 TickTwo TGNSSStateUpdate(GNSSStateUpdateISR, 1000 / UPDATE_RATE_GNSS_STATUS, 0, MILLIS);
 TickTwo TADCUpdate(ADCUpdateISR, 1000 / UPDATE_RATE_ADC, 0, MILLIS);
+TickTwo TGNSSCallback(GNSSCallbackISR, 1000 / GNSS_SOLN_RATE, 0, MILLIS);
 
 /*
 GPS stuff
@@ -224,6 +226,7 @@ void GNSSStateUpdateISR()
 
     // Sanity check the ECEF data of the most recent fix
     GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
+    bool inRoughBounds = currentPosition.posAcc <= 10.0 && currentPosition.velAcc <= 10.0; // Rougher accuracy estimation timeline
 
     GNSSState.isRTCMFresh = ((millis() - lastRTCMDataTime) <= 10000) ? 1 : 0;
 
@@ -238,8 +241,9 @@ void GNSSStateUpdateISR()
         GNSSState.isReady = GNSSState.isFixOK && GNSSState.isECEFInBounds && GNSSState.fixType == 3;
     }
 
-    // If its going back to not ready, temp fix by leaving it there. TODO this is a hack, fix
-    if (!GNSSState.isReady && oldReady)
+    // If its going back to not ready, temp fix by leaving it in readystate there. TODO this is a hack, fix
+    // Except, if the accuracy drops below a rougher bound (10m instead of 5), because it will increase naturally as the experiment proceeds
+    if (!GNSSState.isReady && oldReady && inRoughBounds)
     {
         GNSSState.isReady = true;
     }
@@ -399,6 +403,16 @@ void displayUpdateISR()
     lcd.print(buf);
 }
 
+// Timed interrupt for GNSS callback updating
+void GNSSCallbackISR()
+{
+    // Check for new data from GNSS
+    GNSS.checkUblox();
+    GNSS.checkCallbacks();
+}
+
+// RTK Disabling function (called whenever we get a timeout with RTK)
+
 void RTKDisable()
 {
     lcd.clear();
@@ -538,6 +552,7 @@ void setup()
     TdisplayUpdate.start();
     TGNSSStateUpdate.start();
     TADCUpdate.start();
+    TGNSSCallback.start();
 
     // Start wifi connection
     if (RTK_ENABLED)
@@ -719,14 +734,11 @@ void setup()
 void loop()
 {
 
-    // Check for new data from GNSS
-    GNSS.checkUblox();
-    GNSS.checkCallbacks();
-
     // Software timers
     TdisplayUpdate.update();
     TGNSSStateUpdate.update();
     TADCUpdate.update();
+    TGNSSCallback.update();
 
     // Check serial console for commands
     if (Serial.available() > 0)
