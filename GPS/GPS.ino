@@ -735,10 +735,10 @@ void loop()
 {
 
     // Software timers
+    TGNSSCallback.update(); // Run GNSS callback first
     TdisplayUpdate.update();
     TGNSSStateUpdate.update();
     TADCUpdate.update();
-    TGNSSCallback.update();
 
     // Check serial console for commands
     if (Serial.available() > 0)
