@@ -4,7 +4,7 @@ March 2024
 */
 
 /****** ENABLE RTK ON THE LINE BELOW (comment out to disable) */
-#define RTK_ENABLED_D
+// #define RTK_ENABLED_D
 
 #ifdef RTK_ENABLED_D
 bool RTK_ENABLED = true;
@@ -412,7 +412,6 @@ void GNSSCallbackISR()
 }
 
 // RTK Disabling function (called whenever we get a timeout with RTK)
-
 void RTKDisable()
 {
     lcd.clear();
@@ -422,7 +421,7 @@ void RTKDisable()
     lcd.print("RTK Disabling");
     lcd.setCursor(0, 2);
     lcd.print("Reset to reconnect");
-    delay(5000);
+    delay(3000);
 
     if (ntripClient.connected() == true)
         ntripClient.stop();
@@ -519,18 +518,15 @@ void setup()
     GNSS.saveConfiguration();
 
     // Setup callback functions and update rates
-    // DO NOT RUN SETRATE IT DOES NOT WORK
+    // NOTE: DO NOT RUN SETRATE IT DOES NOT WORK
     GNSS.setAutoNAVHPPOSECEFcallbackPtr(&callback_HPPOSECEF);
-    // GNSS.setAutoNAVHPPOSECEFrate(GNSS_SOLN_RATE);
     GNSS.setAutoNAVVELECEFcallbackPtr(&callback_VELECEF);
-    // GNSS.setAutoNAVVELECEFrate(GNSS_SOLN_RATE);
     GNSS.setAutoPVTcallbackPtr(&callback_PVT); // We only need PVT for SIV and fixtype, so its update rate is lower
-    // GNSS.setAutoPVTrate(1);
 
     if (!dac.begin(0x64))
         error("MCP4728 DAC Fail");
 
-    // Initial voltage spread on DAC
+    // Initial voltage test pattern on DAC
     dac.setChannelValue(MCP4728_CHANNEL_A, 4095);
     dac.setChannelValue(MCP4728_CHANNEL_B, 2048);
     dac.setChannelValue(MCP4728_CHANNEL_C, 1024);
@@ -538,197 +534,17 @@ void setup()
     lcd.print(".");
     delay(100);
 
-    // // Setup ESP32 watchdog timer
-    // disableCore0WDT();
-    // disableCore1WDT();
-    // disableLoopWDT();
-    // lcd.print(".");
-    // delay(100);
-
-    // lcd.print(".");
-    // delay(100);
-
-    // Start timers
+    // Start software timers
     TdisplayUpdate.start();
     TGNSSStateUpdate.start();
     TADCUpdate.start();
     TGNSSCallback.start();
 
-    // Start wifi connection
+    // If RTK is enabled, attempt to connect RTCM handler
     if (RTK_ENABLED)
-    {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("WiFi connecting...");
-
-        Serial.print(F("Connecting to local WiFi"));
-        WiFi.begin(ssid, password);
-
-        unsigned long startConnectTime = millis();
-        const unsigned long timeoutTimeMS = 30000;
-        while (WiFi.status() != WL_CONNECTED)
-        {
-            delay(1000);
-            lcd.setCursor(0, 1);
-            lcd.print("Waiting ");
-            lcd.print((int)round((millis() - startConnectTime) / 1000));
-            lcd.print("/");
-            lcd.print(timeoutTimeMS / 1000);
-            lcd.print("s");
-
-            if (millis() - startConnectTime >= timeoutTimeMS)
-            {
-                lcd.clear();
-                lcd.print("WiFi ConnFail to");
-                lcd.setCursor(0, 1);
-                lcd.print("network:");
-                lcd.setCursor(0, 2);
-                lcd.print(ssid);
-                delay(2000);
-                RTKDisable();
-                return;
-            }
-        }
-
-        lcd.clear();
-        lcd.print(F("WiFi connOK! IP: "));
-        lcd.setCursor(0, 1);
-        lcd.println(WiFi.localIP());
-        lcd.setCursor(0, 2);
-        lcd.print("Network:");
-        lcd.setCursor(0, 3);
-        lcd.print(ssid);
-        delay(2000);
-
-        if (ntripClient.connected() == false)
-        {
-            if (ntripClient.connect(casterHost, casterPort) == false)
-            {
-                lcd.clear();
-                lcd.print("Website ConnFail to");
-                lcd.setCursor(0, 1);
-                lcd.print(casterHost);
-                lcd.print(":");
-                lcd.print(casterPort);
-                delay(2000);
-                RTKDisable();
-                return;
-            }
-            else
-            {
-                lcd.clear();
-                lcd.setCursor(0, 0);
-                lcd.print("Connected to:");
-                lcd.setCursor(0, 1);
-                lcd.print(casterHost);
-                lcd.print(":");
-                lcd.print(casterPort);
-                lcd.setCursor(0, 2);
-                lcd.print("Requesting NTRIP...");
-                const int SERVER_BUFFER_SIZE = 512;
-                char serverRequest[SERVER_BUFFER_SIZE];
-
-                snprintf(serverRequest, SERVER_BUFFER_SIZE, "GET /%s HTTP/1.0\r\nUser-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
-                         mountPoint);
-
-                char credentials[SERVER_BUFFER_SIZE];
-                if (strlen(casterUser) == 0)
-                {
-                    strncpy(credentials, "Accept: */*\r\nConnection: close\r\n", sizeof(credentials));
-                }
-                else
-                {
-                    // Pass base64 encoded user:pw
-                    char userCredentials[sizeof(casterUser) + sizeof(casterUserPW) + 1]; // The ':' takes up a spot
-                    snprintf(userCredentials, SERVER_BUFFER_SIZE, "%s:%s", casterUser, casterUserPW);
-
-                    lcd.setCursor(0, 3);
-                    lcd.print("Sending credentials");
-
-#if defined(ARDUINO_ARCH_ESP32)
-                    // Encode with ESP32 built-in library
-                    base64 b;
-                    String strEncodedCredentials = b.encode(userCredentials);
-                    char encodedCredentials[strEncodedCredentials.length() + 1];
-                    strEncodedCredentials.toCharArray(encodedCredentials, sizeof(encodedCredentials)); // Convert String to char array
-                    snprintf(credentials, sizeof(credentials), "Authorization: Basic %s\r\n", encodedCredentials);
-#else
-                    // Encode with nfriendly library
-                    int encodedLen = base64_enc_len(strlen(userCredentials));
-                    char encodedCredentials[encodedLen];                                         // Create array large enough to house encoded data
-                    base64_encode(encodedCredentials, userCredentials, strlen(userCredentials)); // Note: Input array is consumed
-#endif
-                }
-
-                strncat(serverRequest, credentials, SERVER_BUFFER_SIZE - 1);
-                strncat(serverRequest, "\r\n", SERVER_BUFFER_SIZE - 1);
-                ntripClient.write(serverRequest, strlen(serverRequest));
-            }
-
-            // Wait for response
-            unsigned long timeout = millis();
-            while (ntripClient.available() == 0)
-            {
-                if (millis() - timeout > 5000)
-                {
-                    ntripClient.stop();
-                    lcd.clear();
-                    lcd.print("Ntrip Server");
-                    lcd.setCursor(0, 1);
-                    lcd.print("CredReq Timeout");
-                    delay(2000);
-                    RTKDisable();
-                    return;
-                }
-                delay(10);
-            }
-
-            // Check reply
-            bool connectionSuccess = false;
-            char response[512];
-            int responseSpot = 0;
-            while (ntripClient.available())
-            {
-                if (responseSpot == sizeof(response) - 1)
-                    break;
-
-                response[responseSpot++] = ntripClient.read();
-                if (strstr(response, "200") > 0) // Look for 'ICY 200 OK'
-                    connectionSuccess = true;
-                if (strstr(response, "401") > 0) // Look for '401 Unauthorized'
-                {
-                    Serial.println(F("Hey - your credentials look bad! Check you caster username and password."));
-                    connectionSuccess = false;
-                }
-            }
-            response[responseSpot] = '\0';
-
-            lcd.clear();
-            lcd.setCursor(0, 0);
-            if (connectionSuccess == false)
-            {
-                lcd.print(F("Ntrip BadCred"));
-                lcd.setCursor(0, 1);
-                lcd.print(casterHost);
-                lcd.print(F(": "));
-                lcd.setCursor(0, 2);
-                lcd.print(response);
-                delay(2000);
-                RTKDisable();
-                return;
-            }
-            else
-            {
-                lcd.print(F("RTCM Connected! To:"));
-                lcd.setCursor(0, 1);
-                lcd.print(casterHost);
-                lcd.print(":");
-                lcd.print(casterPort);
-                delay(2000);
-                lastRTCMDataTime = millis(); // Reset timeout
-            }
-        }
-    }
+        attemptRTCMConnect();
+    Serial.println("GPS-RTK good to go. Happy data collecting!");
+    Serial.println("Type 'h' from serial connection to get help message for serial commands");
 }
 
 void loop()
@@ -747,18 +563,45 @@ void loop()
         char receivedChar = Serial.read();
 
         // Check if the received character is 'r'
-        if (receivedChar == 'r')
+        if (receivedChar == '0')
         {
-            Serial.println("Resetting experiment 0 position");
+            Serial.print("Resetting experiment 0 position... ");
             memcpy((void *)&startPosition, (const void *)&currentPosition, sizeof(ECEFStateVector_t));
+            Serial.println("OK");
+        }
+        else if (receivedChar == 'r')
+        {
+            Serial.print("Restarting ESP32... ");
+            ESP.restart();
+            Serial.println("OK"); // This might be the single most useless line of code ever
+        }
+        else if (receivedChar == 'e')
+        {
+            Serial.print("Attempting to enable RTCM/RTK... ");
+            attemptRTCMConnect();
+            Serial.println("OK")
+        }
+        else if (receivedChar == 'd')
+        {
+            Serial.print("Attempting to disable RTCM/RTK... ");
+            if (ntripClient.connected() == true)
+                ntripClient.stop();
+            RTK_ENABLED = false;
+            Serial.println("OK");
         }
         else if (receivedChar == 'h')
         {
-            ESP.restart();
+            Serial.println("Help:\n");
+            Serial.println("Type '0' to reset 0 position");
+            Serial.println("Type 'r' to reset ESP32 processor");
+            Serial.println("Type 'e' to enable RTCM/RTK");
+            Serial.println("Type 'd' to disable RTCM/RTK");
+            Serial.println("Type 'h' to print this help message");
+            Serial.println("\n\n:P good luck >:)");
         }
         else if ((receivedChar != '\n' && receivedChar != '\r')) // Ignore newlines
         {
-            Serial.println("Invalid command. Enter r to reset start position, h to restart code");
+            Serial.println("Invalid command. Type 'h' for help message");
         }
     }
 
@@ -798,17 +641,20 @@ void loop()
     delay(20); // let's not hammer too hard on the I2C bus
 }
 
+// Function to infinite loop / hang processor when we get unrecoverable error
+// Flash the LED, in case there are no other external indications of something wrong (i.e. LCD fails to initialize)
 void hang()
 {
     while (true)
     {
         digitalWrite(18, HIGH);
-        delay(1000);
+        delay(100);
         digitalWrite(18, LOW);
-        delay(1000);
+        delay(100);
     }
 }
 
+// Function to handle a critical error message, where the unit will hang after displaying
 void error(String message)
 {
     lcd.setFastBacklight(0xFF0000);
@@ -818,6 +664,183 @@ void error(String message)
     lcd.setCursor(0, 1);
     lcd.print(message);
     hang();
+}
+
+// Function to attempt to connect RTK/RTCM behavior by connecting to hotspot
+void attemptRTCMConnect()
+{
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi connecting...");
+
+    Serial.print(F("Connecting to local WiFi"));
+    WiFi.begin(ssid, password);
+
+    unsigned long startConnectTime = millis();
+    const unsigned long timeoutTimeMS = 30000;
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(1000);
+        lcd.setCursor(0, 1);
+        lcd.print("Waiting ");
+        lcd.print((int)round((millis() - startConnectTime) / 1000));
+        lcd.print("/");
+        lcd.print(timeoutTimeMS / 1000);
+        lcd.print("s");
+
+        if (millis() - startConnectTime >= timeoutTimeMS)
+        {
+            lcd.clear();
+            lcd.print("WiFi ConnFail to");
+            lcd.setCursor(0, 1);
+            lcd.print("network:");
+            lcd.setCursor(0, 2);
+            lcd.print(ssid);
+            delay(2000);
+            RTKDisable();
+            return;
+        }
+    }
+
+    lcd.clear();
+    lcd.print(F("WiFi connOK! IP: "));
+    lcd.setCursor(0, 1);
+    lcd.println(WiFi.localIP());
+    lcd.setCursor(0, 2);
+    lcd.print("Network:");
+    lcd.setCursor(0, 3);
+    lcd.print(ssid);
+    delay(2000);
+
+    if (ntripClient.connected() == false)
+    {
+        if (ntripClient.connect(casterHost, casterPort) == false)
+        {
+            lcd.clear();
+            lcd.print("Website ConnFail to");
+            lcd.setCursor(0, 1);
+            lcd.print(casterHost);
+            lcd.print(":");
+            lcd.print(casterPort);
+            delay(2000);
+            RTKDisable();
+            return;
+        }
+        else
+        {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Connected to:");
+            lcd.setCursor(0, 1);
+            lcd.print(casterHost);
+            lcd.print(":");
+            lcd.print(casterPort);
+            lcd.setCursor(0, 2);
+            lcd.print("Requesting NTRIP...");
+            const int SERVER_BUFFER_SIZE = 512;
+            char serverRequest[SERVER_BUFFER_SIZE];
+
+            snprintf(serverRequest, SERVER_BUFFER_SIZE, "GET /%s HTTP/1.0\r\nUser-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
+                     mountPoint);
+
+            char credentials[SERVER_BUFFER_SIZE];
+            if (strlen(casterUser) == 0)
+            {
+                strncpy(credentials, "Accept: */*\r\nConnection: close\r\n", sizeof(credentials));
+            }
+            else
+            {
+                // Pass base64 encoded user:pw
+                char userCredentials[sizeof(casterUser) + sizeof(casterUserPW) + 1]; // The ':' takes up a spot
+                snprintf(userCredentials, SERVER_BUFFER_SIZE, "%s:%s", casterUser, casterUserPW);
+
+                lcd.setCursor(0, 3);
+                lcd.print("Sending credentials");
+
+#if defined(ARDUINO_ARCH_ESP32)
+                // Encode with ESP32 built-in library
+                base64 b;
+                String strEncodedCredentials = b.encode(userCredentials);
+                char encodedCredentials[strEncodedCredentials.length() + 1];
+                strEncodedCredentials.toCharArray(encodedCredentials, sizeof(encodedCredentials)); // Convert String to char array
+                snprintf(credentials, sizeof(credentials), "Authorization: Basic %s\r\n", encodedCredentials);
+#else
+                // Encode with nfriendly library
+                int encodedLen = base64_enc_len(strlen(userCredentials));
+                char encodedCredentials[encodedLen];                                         // Create array large enough to house encoded data
+                base64_encode(encodedCredentials, userCredentials, strlen(userCredentials)); // Note: Input array is consumed
+#endif
+            }
+
+            strncat(serverRequest, credentials, SERVER_BUFFER_SIZE - 1);
+            strncat(serverRequest, "\r\n", SERVER_BUFFER_SIZE - 1);
+            ntripClient.write(serverRequest, strlen(serverRequest));
+        }
+
+        // Wait for response
+        unsigned long timeout = millis();
+        while (ntripClient.available() == 0)
+        {
+            if (millis() - timeout > 5000)
+            {
+                ntripClient.stop();
+                lcd.clear();
+                lcd.print("Ntrip Server");
+                lcd.setCursor(0, 1);
+                lcd.print("CredReq Timeout");
+                delay(2000);
+                RTKDisable();
+                return;
+            }
+            delay(10);
+        }
+
+        // Check reply
+        bool connectionSuccess = false;
+        char response[512];
+        int responseSpot = 0;
+        while (ntripClient.available())
+        {
+            if (responseSpot == sizeof(response) - 1)
+                break;
+
+            response[responseSpot++] = ntripClient.read();
+            if (strstr(response, "200") > 0) // Look for 'ICY 200 OK'
+                connectionSuccess = true;
+            if (strstr(response, "401") > 0) // Look for '401 Unauthorized'
+            {
+                Serial.println(F("Hey - your credentials look bad! Check you caster username and password."));
+                connectionSuccess = false;
+            }
+        }
+        response[responseSpot] = '\0';
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        if (connectionSuccess == false)
+        {
+            lcd.print(F("Ntrip BadCred"));
+            lcd.setCursor(0, 1);
+            lcd.print(casterHost);
+            lcd.print(F(": "));
+            lcd.setCursor(0, 2);
+            lcd.print(response);
+            delay(2000);
+            RTKDisable();
+            return;
+        }
+        else
+        {
+            lcd.print(F("RTCM Connected! To:"));
+            lcd.setCursor(0, 1);
+            lcd.print(casterHost);
+            lcd.print(":");
+            lcd.print(casterPort);
+            RTK_ENABLED = true;
+            delay(2000);
+            lastRTCMDataTime = millis(); // Reset timeout
+        }
+    }
 }
 
 // BIGFONT CODE
