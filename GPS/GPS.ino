@@ -225,8 +225,8 @@ void GNSSStateUpdateISR()
     // Note that SIV, fixType and the like are set in the PVT callback
 
     // Sanity check the ECEF data of the most recent fix
-    GNSSState.isECEFInBounds = currentPosition.posAcc <= 5.0 && currentPosition.velAcc <= 5.0;
-    bool inRoughBounds = currentPosition.posAcc <= 10.0 && currentPosition.velAcc <= 10.0; // Rougher accuracy estimation timeline
+    GNSSState.isECEFInBounds = currentPosition.posAcc <= 10.0 && currentPosition.velAcc <= 5.0;
+    bool inRoughBounds = currentPosition.posAcc <= 15.0 && currentPosition.velAcc <= 10.0; // Rougher accuracy estimation timeline
 
     GNSSState.isRTCMFresh = ((millis() - lastRTCMDataTime) <= 10000) ? 1 : 0;
 
@@ -579,7 +579,7 @@ void loop()
         {
             Serial.print("Attempting to enable RTCM/RTK... ");
             attemptRTCMConnect();
-            Serial.println("OK")
+            Serial.println("OK");
         }
         else if (receivedChar == 'd')
         {
